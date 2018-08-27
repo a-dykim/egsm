@@ -254,7 +254,8 @@ def interpolate_neighbors(x_target, x, y):
     return interpolated
 
 
-def gp_interpolate_spectrum(targetfreqs, freqs, spectra, logy=False, error=None, nsamp=1000, fudge_fac=1, option='regular'):
+
+def gp_interpolator(targetfreqs, freqs, data, logy=False, error=None, option='low'):
     """
     Gaussian Interpolate something frequency dependent
     Returns to interpolated target value of stuff;
@@ -273,148 +274,84 @@ def gp_interpolate_spectrum(targetfreqs, freqs, spectra, logy=False, error=None,
     Gaussian Process Interpolated C matrix with a shape (#(targetfreqs), ncomp)
     """
     logfreqs = np.log10(freqs).reshape(-1,1)
+    logtargets = np.log10(targetfreqs) #except AttributeError
     xmin = np.min(logfreqs)
     xmax = np.max(logfreqs)
 
-    if (spectra.shape[1] == 1) or (spectra.ndim == 1):
+    if (data.shape[1] == 1) or (data.ndim == 1):
         ncomp = 1
     else:
-        ncomp = spectra.shape[1]
-    nfreq = len(logfreqs)
-    yfac =spectra.copy() * fudge_fac
-    if logy is True:
-        ys = np.log10(yfac)
-    else:
-        ys = yfac
+        ncomp = data.shape[1]
+
+    nfreqs = len(freqs)
+    ntargets = len(targetfreqs)
+    y = data.copy() * fudge_fac
 
     if option is 'monopole':
         kernel = ConstantKernel() + Matern(length_scale=1) + WhiteKernel()
-        gp = gaussian_process.GaussianProcessRegressor(kernel=kernel)
-
-    elif option is 'regular':
-        kernel = ConstantKernel() + Matern(length_scale=1e-2) #+ WhiteKernel(noise_level=1)
-        if error is None:
-            gp = gaussian_process.GaussianProcessRegressor(kernel=kernel)
-        else:
-            gp = gaussian_process.GaussianProcessRegressor(kernel=kernel, alpha=error**2)
-    else:
-        raise RuntimeError("Specify which spectra to be interpolated")
-    
-    logx_pred = np.linspace(xmin, xmax, nsamp).reshape(-1,1)
-    predictions = np.zeros((nsamp, ncomp))
-    sigmay = np.zeros((nsamp, ncomp))
-    
-    for i in range(ncomp):
-        y = ys[:,i]
-        gp.fit(logfreqs, y)
-        predictions[:,i], sigmay[:,i] = gp.predict(logx_pred, return_std=True)
-      
-    try:    
-        n_targets = len(targetfreqs)
-        target_pred = np.zeros((n_targets, ncomp))
-        for j in range(n_targets):
-            target_pred[j] = interpolate_neighbors(targetfreqs[j], 10**(logx_pred), predictions)
-
-    except TypeError:
-        target_pred = interpolate_neighbors(targetfreqs, 10**(logx_pred), predictions) 
-        
-    if logy is True:
-        return 10**(target_pred)
-    else:
-        return target_pred
-
-
-def gp_interpolator(targetx, x, y, yerr=None, logy=False, option='monopole'):
-    """
-    GP interpolate 1D array 
-
-    Parameter
-    targetx [array or a float]: target x
-    option [str]: 'monopole' and 'norm'
-    """
-    logx = np.log10(x).reshape(-1,1)
-
-    try:
-        logtargets = np.log10(targetx).reshape(-1,1)
-    except AttributeError:
-        logtargets = np.log10(targetx)
-
-    if logy is True:
-        yeval = np.log10(y.copy())
-        if yerr is not None:
-            yerror = yerr ## think more about kernel normalization
-            #yerror = yerr / y 
-    else:
-        yeval = y.copy()
-        yerror = yerr.copy()
-
-    if option is 'monopole':
-        kernel = ConstantKernel() + Matern(length_scale=1)
-        gp = gaussian_process.GaussianProcessRegressor(kernel=kernel, alpha=yerror**2)
-
     elif option is 'norm':
         kernel = ConstantKernel() + Matern(length_scale=1e-2)
-        gp = gaussian_process.GaussianProcessRegressor(kernel=kernel)
-
-    gp.fit(logx, yeval)
-    prediction = gp.predict(logtargets)
-    if logy is True:
-        return 10**prediction
+    elif option is 'low':
+        kernel = ConstantKernel() + Matern(length_scale=1e-2) ## check this
+    elif option is 'high':
+        kernel = ConstantKernel() + Matern(length_scale=1e-3) ## check this
     else:
-        return prediction
+        raise NotImplementedError()
+    gp = gaussian_process.GaussianProcessRegressor(kernel=kernel)
+    target_pred = np.zeros((ntargets, ncomp))
+    for i in range(ncomp):
+        yeval = y[:,i]
+        gp.fit(logfreqs, yeval)
+        target_pred[:,i], sigma[:,i] = gp.predict(logtargets, return_std=True)
+
+    return target_pred
 
 
-def linear_interpolator(targetx, x, y, logx=True):
+
+def linear_interpolator(targetfreqs, freqs, data, logy=False, option='low'):
     """
-    Linear interpolator
+    Linear Interpolate something frequency dependent
+    Returns to interpolated target value of stuff;
     
     Parameters
-    targetx [arrays or a float] : target x
-    """
-    if logx == True:
-        testx = np.log10(x)
-        target = np.log10(targetx)
-    else:
-        testx = x.copy()
-        target = targetx
-    
-    try:
-        n_targets = len(targetx)
-    except TypeError:
-        n_targets = 1
-
-    if y.ndim == 1:
-        ydim = 1
-        interpy = np.interp(target, testx, y) 
-    else:
-        ydim = y.shape[1]
-        if n_targets == 1:
-            interpy = np.array([np.interp(target, testx, y[:,i]) for i in range(ydim)])
-        else:
-            interpy = np.zeros((n_targets, ydim))
-            for i in range(ydim):
-                interpy[:,i] = np.interp(target, testx, y[:,i])
-    return interpy
-
-
-def linear_interpolate_spectrum(targetfreqs, freqs, spectra):
-    """
-    Linear interpolate the spectra
-
-    Parameter:
     targetfreqs [float, list, array]: frequencies to be interpolated
     freqs [array] : input frequencies
     spectra [matrix] : C matrix with a shape (nfreq, ncomp)
+    error [matrix] : error bars of C matrix (use monte carlo)
+    nsamp [int] : number of data points to be initially interpolated
+    fudge_fac [float] : a multiplicative factor that is customized for the Gaussian Kernel
+    option [list] : 'regular' or 'monopole'
+    regular is for the main model spectra and monopole is for the monopole spectra
 
     Returns
-    Linearly Interpolated C matrix with a shape (#(targetfreqs), ncomp)
+    Gaussian Process Interpolated C matrix with a shape (#(targetfreqs), ncomp)
     """
-    logspec = np.log10(freqs)
-    ncomp = spectra.shape[1]
-    interpolated = np.zeros(ncomp)
-    for i in range(ncomp):
-        interpolated[i] = np.interp(np.log10(targetfreqs), freqs, spectra[:,i])
-    return interpolated
+    if (data.shape[1] == 1) or (data.ndim == 1):
+        ncomp = 1
+    else:
+        ncomp = data.shape[1]
+
+    logfreqs = np.log10(freqs).reshape(-1,1)
+    logtargets = np.log10(targetfreqs) #except AttributeError
+    xmin = np.min(logfreqs)
+    xmax = np.max(logfreqs)
+    nfreqs = len(freqs)
+    ntargets = len(targetfreqs)
+
+
+    if option in ['monopole', 'norm']:
+        assert(data.ndim == 1)
+        target_pred = np.interp(logtargets, logfreqs, data)
+
+    elif option in ['low', 'high']:
+        target_pred = np.zeros((ntargets, ncomp))
+        for i in range(ncomp):
+            target_pred[:,i] = np.interp(logtargets, logfreqs, data[:,i])
+    else:
+        raise NotImplementedError()
+
+
+    return target_pred
 
 
 def get_smoothed_errors(data, fit, error, fwhm=0.04):
@@ -571,8 +508,8 @@ def perturb_data(data, error, Cmat, Mmat, peak_evidence, theta, model_resol=0.08
     Nls = generate_Nls(theta, model_resol)
 
     for j in range(nfreq):
-        normalization_fac = normfactor_Nl(Nls[j])
-        random_noise = hp.synfast(Nls[j], 128, verbose=False) * error_scale[j] * normalization_fac
+        normalization = normfactor_Nl(Nls[j])
+        random_noise[j] = hp.synfast(Nls[j], 128, verbose=False) * error_scale[j] * normalization
 
     perturbed_data = data + random_noise
     return perturbed_data

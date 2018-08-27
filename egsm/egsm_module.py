@@ -24,15 +24,23 @@ FREQ_CUTOFF = 22.8 # GHz
 
 
 def default_resolution(freqs):
-    try: 
-        if len(freqs) > 1:
-            freqs = np.array(freqs)
-            if all(freqs < FREQ_CUTOFF): return 0.08
-            else: return 0.015
+    """
+    Assign the default resolution given the frequency model
+    
+    Parameter:
+    freqs [array]
+    """
+    THETA_LOW = 0.08
+    THETA_HIGH = 0.015
+    FREQ_CUTOFF = 22.8 ##GHz
+    freqs = np.array([freqs], dtype=np.float).flatten() 
 
-    except TypeError:
-        if freqs < FREQ_CUTOFF: return 0.08
-        else: return 0.015 
+    if np.all(freqs < FREQ_CUTOFF):
+        return THETA_LOW
+    elif np.all(freqs >= FREQ_CUTOFF):
+        return THETA_HIGH
+    else:
+        raise RuntimeError("Frequencies are mixed up")
 
 
 def format_newdata(data, error, freqs, theta, filename=None):
@@ -123,179 +131,127 @@ class eGSM_map(object):
         Output : sky model in healpix format of nside=128(default) ring scheme
         """
 
+        freqs = np.array([freqs], dtype=np.float).flatten() 
+        freqs = freqs*units.Unit(self.freq_unit)
 
-        if self.freq_unit == 'GHz':
-            freqs = np.array(freqs) * units.Unit(self.freq_unit)
-            freqs_ghz = np.array(freqs)
+        if self.freq_unit is not 'GHz':
+            freqs = freqs.to('GHz')
+        self.generated_freqs = freqs.value
+        self.nfreqs = len(self.generated_freqs)
+
+        if self.generated_freqs >= FREQ_CUTOFF:
+            self.fkey = 'high'
         else:
-            freqs = np.array(freqs) * units.Unit(self.freq_unit)
-            freqs_ghz = freqs.to('GHz').value
+            self.fkey = 'low'
 
-        try:
-            assert np.min(freqs_ghz) >= 0.022
-            assert np.max(freqs_ghz) <= 3000
 
-        except AssertionError:
-            raise RuntimeError('Frequency that you requested is outside of eGSM Model')
-
-        #self.datafile = select_data_file(freqs_ghz)
         if resol is'default':
-            resol = default_resolution(freqs_ghz)
+            resol = default_resolution(self.generated_freqs)
+            
+        assert (np.all(self.generated_freqs >= FREQ_CUTOFF) or resol >= 0.08) # Requested resolution is above eGSM capacity
+        assert (np.all(self.generated_freqs < FREQ_CUTOFF) or resol >= 0.015) # Requested resolution is above eGSM capacity
+        assert (np.all(self.generated_freqs < FREQ_CUTOFF) or resol < 0.015) # You might be mixing frequencies
 
-        try:
-            if len(freqs_ghz) > 1:
-                if not(all(freqs_ghz >= FREQ_CUTOFF) or all(freqs_ghz < FREQ_CUTOFF)):
-                    raise RuntimeError('Do separate run for low and high frequencies model')
-        except TypeError:
-            pass
-        
+
+        assert np.min(self.generated_freqs) >= 0.022
+        assert np.max(self.generated_freqs) <= 3000
+        if not(np.all(self.generated_freqs >= FREQ_CUTOFF) or np.all(self.generated_freqs < FREQ_CUTOFF)):
+            wn.warnings('Do separate run for low and high frequencies model')
+
+
+        if self.map_unit == 'TCMB':
+            conversion = 1. / h.K_CMB2MJysr(1., 1e9 * self.generated_freqs)
+        elif self.map_unit == 'TRJ':
+            conversion = 1. / h.K_RJ2MJysr(1., 1e9 * self.generated_freqs)
+        else:
+            conversion = 1.
+
 
         ## Interpolation step
 
         target_Cmat = []
-        target_Csigma = []
 
-        #low_index = np.min(self.peak_evidence) -> with nmfopt skymodel might be tricky
-        #high_index = np.max(self.peak_evidence)
-
-        if GP == True:
-            for i in range(self.nfreq):
-                #Cintp, sigma_intp = h.gp_interpolate_spectrum(freqs_ghz, self.spec, self.Cmat, self.Cerror) 
-                Cintp = h.gp_interpolate_spectrum(freqs_ghz, self.spec, self.Cmat[i]) 
-                target_Cmat.append(Cintp)
-                #target_Csigma.append(sigma_intp)
-            interp_norm = h.gp_interpolator(freqs_ghz, self.spec,self.norm, logy=True, option='norm') #use same kernel to ensure this
+        if GP == True: ## Should I even offer linear interpolation option?
+            interpolator = h.gp_interpolator
         else:
-            for i in range(self.nfreq):
-                Cintp =  h.linear_interpolator(freqs_ghz, self.spec, self.Cmat[i], logx=True)
-                target_Cmat.append(Cintp)
-            interp_norm = h.linear_interpolator(freqs_ghz, self.spec, self.norm)
-        
-        sky_model = h.nmfoptimal_skymodel(target_Cmat, self.Mmat, self.peak_evidence)
-        target_fit = sky_model.T
-        
-        target_fit *= interp_norm
-        target_fit += self.offset ## return to MJy/sr unit
-        
+            interpolator = h.lin_interpolator
+
+        interp_norm = interpolator(self.generated_freqs, self.spec, self.norm, logy=False, option='norm')
+        for i in range(self.nfreq):
+            Cintp = interpolator(self.generated_freqs, self.spec, self.Cmat[i], option=self.fkey)
+            target_Cmat.append(Cintp)
+
+        sky_model = h.nmfoptimal_skymodel(target_Cmat, self.Mmat, self.peak_evidence) #(nfreq, npix)
+        target_fit = sky_model.T * interp_norm + self.offset #(npix, nfreq)
 
         ### Monopole correction
-        monopole_pred = h.gp_interpolator(freqs_ghz, self.monospec, self.monopole, self.monoerror, logy=True, option='monopole')
-        #monopole_pred = h.gp_interpolate_monopole(freqs_ghz, self.monospec, self.monopole, self.monoerror) ## change with GP
-        output_trans = target_fit - np.nanmean(target_fit) + monopole_pred  ### monopole calibrated result
+        monopole_pred = interpolator(self.generated_freqs, self.monospec, self.monopole, self.monoerror, option='monopole')
+        output = target_fit - np.nanmean(target_fit) + monopole_pred  ### monopole calibrated result
+        output *= conversion
 
-        if self.map_unit == 'TCMB':
-            conversion = 1. / h.K_CMB2MJysr(1., 1e9 * freqs_ghz)
-        elif self.map_unit == 'TRJ':
-            conversion = 1. / h.K_RJ2MJysr(1., 1e9 * freqs_ghz)
-        else:
-            conversion = 1.
-
-        output_trans *= conversion
-        output = output_trans.T
-        self.generated_freqs = freqs
-
-        try:
-            if len(self.generated_freqs) > 1:
-                if any(freqs_ghz < 22.8) and resol < 0.08:
-                    raise RuntimeError('Requested resolution is above eGSM capacity')
-                elif all(freqs_ghz < 22.8) and resol >= 0.08:
-                    self.generated_map = h.smooth_maps(output, fwhm=resol)
-                elif any(freqs_ghz >= 22.8) and resol < 0.015:
-                    raise RuntimeError('Requested resolution is above eGSM capacity')  
-                elif all(freqs_ghz >= 22.8) and resol >= 0.015:
-                    self.generated_map = h.smooth_maps(output, fwhm=resol)
-                else:
-                    raise RuntimeError('You might be mixing frequencies')
-        except TypeError:
-            if freqs_ghz < 22.8 and resol < 0.08:
-                raise RuntimeError('Requested resolution is above eGSM capacity')
-            elif freqs_ghz < 22.8 and resol >= 0.08:
-                self.generated_map = h.smooth_maps(output, fwhm=resol)
-            elif freqs_ghz >= 22.8 and resol < 0.015:
-                raise RuntimeError('Requested resolution is above eGSM capacity')  
-            elif freqs_ghz >= 22.8 and resol >= 0.015:
-                self.generated_map = h.smooth_maps(output, fwhm=resol)
+        self.generated_map = h.smooth_maps(output.T, fwhm=resol)  
                 
         return self.generated_map
 
              
     
-    def show_map(self, index=0, multiview=False, norm_opt='hist'):
+    def view_map(self, option='hist', show=True):
         """
         View the mollweide projection of the generated map
 
         Parameters
-        index [int] : index of map to see. Only required to see one particular map in your generated maps
-        multiview [bool] : True if want to see all of generated maps (Default:False)
-        norm : 'hist', 'log' color normalization scheme (Default:'None')
+        option : 'None', 'hist', 'log' color normalization scheme (Default:'None')
         """
-        try:
-            nfreqs = len(self.generated_freqs)
-        except TypeError:
-            nfreqs = 1
         
         if self.generated_map is None:
             raise RuntimeError("You haven't generate the map yet")
 
-        if multiview == False:
-            if self.generated_map.ndim == 2:
-                skymap = self.generated_map[index]
-                skyfreq = self.generated_freqs[index]
-            else:
-                skymap = self.generated_map
-                skyfreq = self.generated_freqs
-
-            hp.mollview(skymap, coord='G', norm=norm_opt, title='eGSM at %s %s' %(str(skyfreq), self.map_unit))
-            plt.show()
-
+        if self.nfreqs == 1:
+            skypred = hp.mollview(self.generated_map, coord='G', norm=option, title='eGSM Sky at %s %s' %(str(self.generated_freqs), self.map_unit))
         else:
-            if nfreqs == 1:
-                skymap = self.generated_map
-                skyfreq = self.generated_freqs 
-                hp.mollview(skymap, coord='G', norm=norm_opt, title='eGSM at %s %s' %(str(skyfreq), self.map_unit))
-                plt.show()
-            else:
-                for i in range(nfreqs):
-                    skymap = self.generated_map[i]
-                    skyfreq = self.generated_freqs[i]
-                    hp.mollview(skymap, coord='G', norm=norm_opt, title='eGSM at %s %s' %(str(skyfreq), self.map_unit))
-                    plt.show() ## think whether plt.show will process after the mollview        
+            skypred = np.zeros_like(self.generated_map)
+            for i in range(self.nfreqs):
+                skypred[i] = hp.mollview(self.generated_map[i], coord='G', norm=option, title=title='eGSM Sky at %s %s' %(str(self.generated_freqs[i]), self.map_unit))
+
+        if show is True:
+            plt.show()
+        else:
+            pass
+        
+        return skypred
+
 
     
-    def save_map(self, filename=None, file_ext='npz'):
+    def save_map(self, filename=None, fits=False):
         """
-        Write maps
-        Multiple maps will be saved as npz by default
-        A single map will be saved as npz if fits option is False
+        Write generated maps into files, if fits is False, the map will be saved as .npz
+        By default, all files will be saved to the egsm/output directory
 
-        Parameter:
-        filepath [str] : a full file path to save output file
-                        (default: None) will save all files on the egsm output directory
-        file_ext [str] : save file format
+        Parameters:
+        filename [str] : A name of the output file 
+        file_ext [str] : save file format either .npz or .fits
         """
-        try:
-            nfreqs = len((self.generated_freqs).value)
-        except TypeError:
-            nfreqs = 1
+        if filename is None:
+            filename = 'egsm_maps'
 
-        if  nfreqs> 1:
-            minf = np.min((self.generated_freqs).value)
-            maxf = np.max((self.generated_freqs).value)             
-            np.savez('output/egsm_multimaps%dto%d%s_%s.npz' %(minf, maxf, self.freq_unit, self.map_unit), freqs=(self.generated_freqs).value, maps=self.generated_map)
-        elif nfreqs == 1:
-            if filename is None:
-                file = 'output/egsm_%d%s_%s' %((self.generated_freqs).value, self.freq_unit, self.map_unit)
+        if self.nfreqs == 1:
+            fullname = 'output/'+filename+'_'+str(self.generated_freqs)+str(self.freq_unit)+'_'+str(self.map_unit)
+            if fits is False:
+                np.savez(fullname+'.npz', spec=(self.generated_freqs).value, map=self.generated_map)
             else:
-                file = 'output/'+filename
-        
-            if file_ext == 'npz':
-                np.savez(file+'.'+file_ext, idata=self.generated_map)
-            elif file_ext == 'fits':
-                hp.write_map(file+'.'+file_ext, self.generated_map, column_units=self.map_unit)
-            elif file_ext == 'txt':
-                np.savetxt(file+'.'+file_ext, self.generated_map)
+                hp.fitsfunc.write_map(fullname, self.generated_map, coord='G', column_units=self.map_unit)
+
+        else: 
+            fgen = self.generated_freqs.tolist()
+            fcombined = '-'.join(map(str, fgen))
+
+            if fits is False:
+                np.savez('output/'+filename+fcombined+'%s_%s.npz' %(self.freq_unit, self.map_unit), specs=(self.generated_freqs).value, maps=maps=self.generated_map)
             else:
-                raise RuntimeError("%s format is not supported" %file_ext)
+                for i in range(self.nfreqs):
+                    fullname = 'output/'+filename+'_'+str(self.generated_freqs[i])+str(self.freq_unit)+'_'+str(self.map_unit)
+                    hp.fitsfunc.write_map(fullname, self.generated_map[i], coord='G', column_units=self.map_unit)
+
 
         return print('Map[s] Saved!')
 
@@ -439,39 +395,39 @@ class egsm_CORE(object):
         return self.monopole
 
 
-def nmfoptimal_skymodel(Cmat, Mmat, peak_evidence):
-    """
-    Compute the optimal sky model based on the peak evidence expectation
-    
-    Parameters
-    Cmat [matrix] : NMF Spectral Template with a shape (nfreq, ncomp)
-    Mmat [matrix] : NMF Spatial Templates with a shape (ncomp, npix)
-    peak_evidence [array] : Peak Evidence template computed in a given model
-    """    
-    npix = len(peak_evidence)
-    mincomp = int(np.nanmin(peak_evidence))
-    maxcomp = int(np.nanmax(peak_evidence))
-    
-    try:
-        nfreq = len(Cmat[0])
-    except TypeError:
-        nfreq = 1
+    def nmfoptimal_skymodel(Cmat, Mmat, peak_evidence):
+        """
+        Compute the optimal sky model based on the peak evidence expectation
         
-    if nfreq is 1:
-        opt_map = np.zeros(npix)
-    else:
-        opt_map = np.zeros((nfreq, npix))
-    
-    for i in range(mincomp, maxcomp+1):
-        loc = np.where(peak_evidence == i)[0]
-        fitmap = np.dot(Cmat[i-1], Mmat[i-1]) ## for 0 represent 1st components
+        Parameters
+        Cmat [matrix] : NMF Spectral Template with a shape (nfreq, ncomp)
+        Mmat [matrix] : NMF Spatial Templates with a shape (ncomp, npix)
+        peak_evidence [array] : Peak Evidence template computed in a given model
+        """    
+        npix = len(peak_evidence)
+        mincomp = int(np.nanmin(peak_evidence))
+        maxcomp = int(np.nanmax(peak_evidence))
         
-        if opt_map.ndim ==1:
-            opt_map[loc] = fitmap[loc]
+        try:
+            nfreq = len(Cmat[0])
+        except TypeError:
+            nfreq = 1
+            
+        if nfreq is 1:
+            opt_map = np.zeros(npix)
         else:
-            opt_map[:,loc] = fitmap[:,loc]
+            opt_map = np.zeros((nfreq, npix))
+        
+        for i in range(mincomp, maxcomp+1):
+            loc = np.where(peak_evidence == i)[0]
+            fitmap = np.dot(Cmat[i-1], Mmat[i-1]) ## for 0 represent 1st components
+            
+            if opt_map.ndim ==1:
+                opt_map[loc] = fitmap[loc]
+            else:
+                opt_map[:,loc] = fitmap[:,loc]
 
-    return opt_map
+        return opt_map
 
 
     def interpolate_sky(self, freqs, resol='default', GP=True):
@@ -479,68 +435,67 @@ def nmfoptimal_skymodel(Cmat, Mmat, peak_evidence):
         Acquire the sky prediction at requested frequencies 
         """
 
-        if self.freq_unit == 'GHz':
-            freqs = np.array(freqs) * units.Unit(self.freq_unit)
-            freqs_ghz = np.array(freqs)
+        freqs = np.array([freqs], dtype=np.float).flatten() 
+        freqs = freqs*units.Unit(self.freq_unit)
+
+        if self.freq_unit is not 'GHz':
+            freqs = freqs.to('GHz')
+        self.generated_freqs = freqs.value
+        self.nfreqs = len(self.generated_freqs)
+
+        if self.generated_freqs >= FREQ_CUTOFF:
+            self.fkey = 'high'
         else:
-            freqs = np.array(freqs) * units.Unit(self.freq_unit)
-            freqs_ghz = freqs.to('GHz').value
+            self.fkey = 'low'
 
-        try:
-            assert np.min(freqs_ghz) >= np.min(self.spec)
-            assert np.max(freqs_ghz) <= np.max(self.spec)
-
-        except AssertionError:
-            raise RuntimeError('Frequency that you requested is outside of input frequency ranges')
-
-        #self.datafile = select_data_file(freqs_ghz)
         if resol is'default':
-            resol = self.resol
-        else:
-            pass
-        ## Interpolation step
-        target_Cmat = []
-        target_Csigma = []
+            resol = default_resolution(self.generated_freqs)
+            
+        assert (np.all(self.generated_freqs >= FREQ_CUTOFF) or resol >= 0.08) # Requested resolution is above eGSM capacity
+        assert (np.all(self.generated_freqs < FREQ_CUTOFF) or resol >= 0.015) # Requested resolution is above eGSM capacity
+        assert (np.all(self.generated_freqs < FREQ_CUTOFF) or resol < 0.015) # You might be mixing frequencies
 
-        if GP == True:
-            for i in range(self.nfreq):
-                #Cintp, sigma_intp = h.gp_interpolate_spectrum(freqs_ghz, self.spec, self.Cmat, self.Cerror) 
-                Cintp = h.gp_interpolate_spectrum(freqs_ghz, self.spec, self.Cmat[i]) 
-                target_Cmat.append(Cintp)
-                #target_Csigma.append(sigma_intp)
-            interp_norm = h.gp_interpolator(freqs_ghz, self.spec,self.norm, logy=True, option='norm') #use same kernel to ensure this
-        else:
-            for i in range(self.nfreq):
-                Cintp =  h.linear_interpolator(freqs_ghz, self.spec, self.Cmat[i], logx=True)
-                target_Cmat.append(Cintp)
-            interp_norm = h.linear_interpolator(freqs_ghz, self.spec, self.norm)
-        
-        sky_model = h.nmfoptimal_skymodel(target_Cmat, self.Mmat, self.peak_evidence)
-        target_fit = sky_model.T
-        
-        target_fit *= interp_norm
-        target_fit += self.offset ## return to MJy/sr unit
-        
 
-        ### Monopole correction
-        monopole_pred = h.gp_interpolator(freqs_ghz, self.monospec, self.monomean, self.monoerror, logy=True, option='monopole')
-        output_trans = target_fit - np.nanmean(target_fit) + monopole_pred  ### monopole calibrated result
+        assert np.min(self.generated_freqs) >= 0.022
+        assert np.max(self.generated_freqs) <= 3000
+        if not(np.all(self.generated_freqs >= FREQ_CUTOFF) or np.all(self.generated_freqs < FREQ_CUTOFF)):
+            wn.warnings('Do separate run for low and high frequencies model')
+
 
         if self.map_unit == 'TCMB':
-            conversion = 1. / h.K_CMB2MJysr(1., 1e9 * freqs_ghz)
+            conversion = 1. / h.K_CMB2MJysr(1., 1e9 * self.generated_freqs)
         elif self.map_unit == 'TRJ':
-            conversion = 1. / h.K_RJ2MJysr(1., 1e9 * freqs_ghz)
+            conversion = 1. / h.K_RJ2MJysr(1., 1e9 * self.generated_freqs)
         else:
             conversion = 1.
 
-        output_trans *= conversion
-        output = output_trans.T
-        self.generated_freqs = freqs
-            
+
+        ## Interpolation step
+
+        target_Cmat = []
+
+        if GP == True: ## Should I even offer linear interpolation option?
+            interpolator = h.gp_interpolator
+        else:
+            interpolator = h.lin_interpolator
+
+        interp_norm = interpolator(self.generated_freqs, self.spec, self.norm, logy=False, option='norm')
+        for i in range(self.nfreq):
+            Cintp = interpolator(self.generated_freqs, self.spec, self.Cmat[i], option=self.fkey)
+            target_Cmat.append(Cintp)
+
+        sky_model = h.nmfoptimal_skymodel(target_Cmat, self.Mmat, self.peak_evidence) #(nfreq, npix)
+        target_fit = sky_model.T * interp_norm + self.offset #(npix, nfreq)
+
+        ### Monopole correction
+        monopole_pred = interpolator(self.generated_freqs, self.monospec, self.monopole, self.monoerror, option='monopole')
+        output = target_fit - np.nanmean(target_fit) + monopole_pred  ### monopole calibrated result
+        output *= conversion
+
         if resol < self.resol:
             raise RuntimeError('You requested resolution higher than the convolved resolution')
         else:
-            self.generated_map = h.smooth_maps(output, fwhm=resol)
+            self.generated_map = h.smooth_maps(output.T, fwhm=resol)  
 
         return self.generated_map
 
@@ -599,5 +554,7 @@ def nmfoptimal_skymodel(Cmat, Mmat, peak_evidence):
 
     def get_Cmat(self, mode):
         return self.Cmat[mode]
+
+
 
 
