@@ -1,6 +1,6 @@
-# egsm
-Global Sky Model v3 (under construction)
+Global Sky Model v3: eGSM 
 ====================
+(under construction)
 
 **Update Note**
 * monopole calibration 
@@ -9,8 +9,7 @@ Global Sky Model v3 (under construction)
 
 **Description**
 
-eGSM is a Python package for building a foreground sky from 22MHz to 3THz. The algorithm is capable of computing the sky model and its error estimate.
-To support a wide range of frequencies more effectively and accurately, we offer two separate models covering different frequency ranges: low (22MHz to 30GHz) and high (22GHz to 3THz).
+eGSM is a Python package for building a foreground sky from 22MHz to 3THz. The algorithm is capable of computing a sky model at any frequency and its error estimate. To support a wide range of frequencies more accurately, we offer two separate models covering different frequency ranges: low (22MHz to 30GHz) and high (22GHz to 3THz).
 
 
 Installation
